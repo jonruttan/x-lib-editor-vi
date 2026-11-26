@@ -244,11 +244,9 @@
 ; busybox's string_insert: S put in at P, recorded as UNDO says
 (def %vi-string-insert!
   (fn (_ p s undo)
-    (def n (byte-len s))
-    (%vi-undo-push-insert! p n undo)
-    (%vi-hole-make! p n)
-    (cu-ptr-call %vi-c-memcpy (vi+ %vi-taddr p) s n)
-    (set! %vi-nl-total (vi+ %vi-nl-total (%vi-newlines-of s)))))
+    (%vi-undo-push-insert! p (byte-len s) undo)
+    (%vi-buf insert! p s)
+    (%vi-sync!)))
 
 ; "x: the register the next command yanks into or puts from
 (def %vi-cmd-name-reg

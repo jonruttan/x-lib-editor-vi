@@ -6,3 +6,6 @@
 (dialect he)
 
 (requires-release "v0.63.0")
+
+; The text and its undo: editor/buffer and editor/undo.
+(requires-bundle "editor" "v0.1.0" "jonruttan/x-lib-editor")

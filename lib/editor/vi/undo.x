@@ -7,212 +7,109 @@
 ; @license MIT No Attribution (MIT-0)
 ;
 ; u and ., each busybox's (editors/vi.c, with FEATURE_VI_UNDO, its queue,
-; and FEATURE_VI_DOT_CMD).  Every change to the text says how it may be
-; undone: not at all, on its own, chained to the change before it so one u
-; takes both back, or queued, so a run of typing or backspacing comes back
-; as one.  The change count busybox shows is the undo stack's height: each
-; record pushed adds one, each popped takes one away.
+; and FEATURE_VI_DOT_CMD).  The undo stack is editor/undo's Undo: every
+; change to the text says how it may be undone, and the change count busybox
+; shows is the stack's height.  What u says, and where it leaves the cursor,
+; are here.
 ;
 ; . replays the keys of the last command that changed the text: from the
 ; command's own key to the end of it, as typed, with its count before them.
 
-; --- the undo stack ---------------------------------------------------------
-
-; how a change may be undone, as the callers say it
 (module editor/vi/editor)
 
-(def %vi-no-undo 0)
-(def %vi-allow-undo 1)
-(def %vi-allow-undo-chain 2)
-(def %vi-allow-undo-queued 3)
+; --- the undo stack ---------------------------------------------------------
 
-; the records' types: text put in, text taken out, either chained to the one
-; below it, or either queued; and the queue's own states
-(def %vi-u-ins 0)
-(def %vi-u-del 1)
-(def %vi-u-ins-chain 2)
-(def %vi-u-del-chain 3)
-(def %vi-u-ins-queued 4)
-(def %vi-u-del-queued 5)
-(def %vi-u-use-spos 32)
-(def %vi-u-empty 64)
-(def %vi-undo-queue-max 256)
+; The stack and its queue are the Undo's, editor/undo; what a u says, and
+; where it leaves the cursor, are vi's.
 
-(def %vi-undo-stack ())     ; newest first: (TYPE START LENGTH TEXT), TEXT a raw buffer
-(def %vi-undo-q 0)          ; the bytes queued
-(def %vi-undo-state 64)     ; what the queue holds: %vi-u-ins, %vi-u-del or empty
-(def %vi-undo-spos 0)       ; where the queued change starts
-(def %vi-undo-bytes ())     ; the bytes a queued deletion took, leftmost first
+; how a change may be undone, as the callers say it
+(def %vi-no-undo (Undo none))
+(def %vi-allow-undo (Undo alone))
+(def %vi-allow-undo-chain (Undo chain))
+(def %vi-allow-undo-queued (Undo queued))
 
-; busybox's vi_main: nothing to undo and nothing queued, once a run
+; the records' types
+(def %vi-u-ins (Undo ins))
+(def %vi-u-del (Undo del))
+(def %vi-u-ins-chain (Undo ins-chain))
+(def %vi-u-del-chain (Undo del-chain))
+(def %vi-u-ins-queued (Undo ins-queued))
+(def %vi-u-del-queued (Undo del-queued))
+
+; busybox's vi_main: the text and its undo, once a run
 (def %vi-undo-init!
   (fn (_)
-    (set! %vi-undo-stack ())
-    (set! %vi-undo-q 0)
-    (set! %vi-undo-state %vi-u-empty)
-    (set! %vi-undo-spos 0)
-    (set! %vi-undo-bytes ())))
+    (set! %vi-buf (Buffer make))
+    (set! %vi-u (Undo make %vi-buf))
+    (set! %vi-mod 0)
+    (set! %vi-queued #f)
+    (set! %vi-lc-version -1)
+    (%vi-sync!)))
 
-; busybox's flush_undo_data: a new text starts with nothing to undo
-(def %vi-undo-flush! (fn (_) (set! %vi-undo-stack ())))
-
-; busybox's undo_push: LEN bytes at SRC as a record of TYPE, or into the queue
+; Each push answers the change count, which vi keeps.  A commit is asked on
+; every motion key, so it is sent only when something was queued since the
+; last one.
+(def %vi-queued #f)
+(def %vi-undo-flush! (fn (_) (%vi-u flush!)))
 (def %vi-undo-push!
   (fn (_ src len type)
-    (match
-      ((= type %vi-u-empty) ())
-      ((= type %vi-u-del-queued) (%vi-undo-queue-del! src len))
-      ((= type %vi-u-ins-queued) (%vi-undo-queue-ins! src len))
-      ((if (= type %vi-u-del) #t (= type %vi-u-del-chain))
-        (%vi-undo-record! src type (%vi-text-copy src (%vi-undo-del-len len))))
-      (#t (%vi-undo-record! src type (pair "" len))))))
-
-; a deletion of the whole text keeps one byte fewer: the newline an empty
-; text gets back
-(def %vi-undo-del-len (fn (_ len) (if (= len %vi-end) (vi- len 1) len)))
-
-; LEN bytes of the text from P, NUL and all: (BUFFER . LENGTH)
-(def %vi-text-copy
-  (fn (_ p len)
-    (def n (vi-max 0 (vi-min len (vi- %vi-room p))))
-    (def s (str-make-raw (vi+ n 1)))
-    (cu-ptr-call %vi-c-memcpy (vi-str->ptr s) (vi+ %vi-taddr p) n)
-    (pair s n)))
-
-(def %vi-undo-record!
-  (fn (_ start type text)
-    (set! %vi-undo-stack (pair (list type start (rest text) (first text)) %vi-undo-stack))
-    (set! %vi-modified (vi+ %vi-modified 1))))
-
-; one byte taken out, onto the queue of deletions; the queue of insertions,
-; if that is what it holds, is committed first
-(def %vi-undo-queue-del!
-  (fn (_ src len)
-    (match
-      ((if (= len 1) #f #t) ())
-      ((= %vi-undo-state %vi-u-ins)
-        (do (%vi-undo-queue-commit!) (%vi-undo-queue-del! src len)))
-      (#t (do (set! %vi-undo-state %vi-u-del)
-              (set! %vi-undo-spos src)
-              (set! %vi-undo-q (vi+ %vi-undo-q 1))
-              (set! %vi-undo-bytes (pair (vi& (byte-at %vi-text src) 255) %vi-undo-bytes))
-              (if (= %vi-undo-q %vi-undo-queue-max) (%vi-undo-queue-commit!) ()))))))
-
-; LEN bytes put in, onto the queue of insertions, committed each time it
-; fills -- which leaves it empty while the count goes on, as busybox's does
-(def %vi-undo-queue-ins!
-  (fn (_ src len)
-    (match
-      ((vi< len 1) ())
-      ((= %vi-undo-state %vi-u-del)
-        (do (%vi-undo-queue-commit!) (%vi-undo-queue-ins! src len)))
-      (#t (do (if (= %vi-undo-state %vi-u-empty)
-                (do (set! %vi-undo-state %vi-u-ins) (set! %vi-undo-spos src))
-                ())
-              (%vi-undo-count-in! len))))))
-
-(def %vi-undo-count-in!
-  (fn (self len)
-    (if (vi< 0 len)
-      (do (set! %vi-undo-q (vi+ %vi-undo-q 1))
-          (if (= %vi-undo-q %vi-undo-queue-max) (%vi-undo-queue-commit!) ())
-          (self (vi- len 1)))
-      ())))
-
-; busybox's undo_queue_commit: what the queue holds, as one record starting
-; where the queued change starts
-(def %vi-undo-queue-commit!
-  (fn (_)
-    (if (vi< 0 %vi-undo-q)
-      (do (%vi-undo-commit-as! %vi-undo-state)
-          (set! %vi-undo-state %vi-u-empty)
-          (set! %vi-undo-q 0)
-          (set! %vi-undo-bytes ()))
-      ())))
-
-(def %vi-undo-commit-as!
-  (fn (_ state)
-    (match
-      ((= state %vi-u-del)
-        (%vi-undo-record! %vi-undo-spos %vi-u-del
-          (%vi-bytes-copy %vi-undo-bytes (%vi-undo-del-len %vi-undo-q))))
-      ((= state %vi-u-ins) (%vi-undo-record! %vi-undo-spos %vi-u-ins (pair "" %vi-undo-q)))
-      ; filled while empty: a record busybox pushes and can not undo
-      (#t (%vi-undo-record! %vi-undo-spos %vi-u-empty (pair "" %vi-undo-q))))))
-
-; the first N of BYTES as (BUFFER . LENGTH)
-(def %vi-bytes-copy
-  (fn (_ bytes n)
-    (def s (str-make-raw (vi+ n 1)))
-    (%vi-bytes-fill (vi-str->ptr s) 0 n bytes)
-    (pair s n)))
-(def %vi-bytes-fill
-  (fn (self ptr i n bytes)
-    (if (if (vi< i n) (if (null? bytes) #f #t) #f)
-      (do (vi-ptr-set! ptr i (first bytes) 1) (self ptr (vi+ i 1) n (rest bytes)))
-      ())))
-
-; busybox's undo_push_insert: LEN bytes put in at P, recorded as UNDO says
+    (if (if (= type %vi-u-ins-queued) #t (= type %vi-u-del-queued)) (set! %vi-queued #t) ())
+    (set! %vi-mod (%vi-u push! src len type))))
 (def %vi-undo-push-insert!
   (fn (_ p len undo)
-    (match
-      ((= undo %vi-allow-undo) (%vi-undo-push! p len %vi-u-ins))
-      ((= undo %vi-allow-undo-chain) (%vi-undo-push! p len %vi-u-ins-chain))
-      ((= undo %vi-allow-undo-queued) (%vi-undo-push! p len %vi-u-ins-queued))
-      (#t ()))))
-
-; the same for LEN bytes about to be taken out at P
+    (if (= undo %vi-allow-undo-queued) (set! %vi-queued #t) ())
+    (set! %vi-mod (%vi-u push-insert! p len undo))))
 (def %vi-undo-push-delete!
   (fn (_ p len undo)
-    (match
-      ((= undo %vi-allow-undo) (%vi-undo-push! p len %vi-u-del))
-      ((= undo %vi-allow-undo-chain) (%vi-undo-push! p len %vi-u-del-chain))
-      ((= undo %vi-allow-undo-queued) (%vi-undo-push! p len %vi-u-del-queued))
-      (#t ()))))
+    (if (= undo %vi-allow-undo-queued) (set! %vi-queued #t) ())
+    (set! %vi-mod (%vi-u push-delete! p len undo))))
+(def %vi-undo-queue-commit!
+  (fn (_)
+    (if %vi-queued
+      (do (set! %vi-queued #f) (set! %vi-mod (%vi-u commit!)))
+      ())))
 
 ; --- u ----------------------------------------------------------------------
 
-; busybox's undo_pop: the newest record undone, and the ones chained under it
+; busybox's undo_pop: the newest record undone, and the ones chained under
+; it, each told on the status line; the last, not chained, leaves the cursor
+; at its start.  A chain that runs off the stack, or a stack with nothing on
+; it, says so.
 (def %vi-undo-pop!
-  (fn (self)
-    (%vi-undo-queue-commit!)
-    (if (null? %vi-undo-stack)
+  (fn (_)
+    (def done (%vi-u pop!))
+    (set! %vi-queued #f)
+    (set! %vi-mod (%vi-u modified))
+    (%vi-sync!)
+    (List map (fn (_ e) (%vi-undo-told e)) done)
+    (if (if (null? done) #t (Undo chained? (first (List last done))))
       (%vi-status-line! "Already at oldest change")
-      (%vi-undo-pop-top! self (first %vi-undo-stack)))))
+      (%vi-undo-landed (List last done)))))
 
-; the record undone, then taken off the stack; its count is told first
-(def %vi-undo-pop-top!
-  (fn (_ again rec)
-    (def type (first rec))
-    (%vi-undo-apply! rec)
-    (set! %vi-undo-stack (rest %vi-undo-stack))
-    (set! %vi-modified (vi- %vi-modified 1))
-    (if (if (= type %vi-u-del-chain) #t (= type %vi-u-ins-chain)) (again) ())))
-
-(def %vi-undo-apply!
-  (fn (_ rec)
-    (def type (first rec))
-    (def start (first (rest rec)))
-    (def len (first (rest (rest rec))))
+(def %vi-undo-told
+  (fn (_ e)
+    (def type (first e))
+    (def start (first (rest e)))
+    (def len (first (rest (rest e))))
+    (def count (first (rest (rest (rest e)))))
     (match
-      ((if (= type %vi-u-del) #t (= type %vi-u-del-chain))
-        (do (%vi-hole-make! start len)
-            (cu-ptr-call %vi-c-memcpy (vi+ %vi-taddr start) (first (rest (rest (rest rec)))) len)
-            (set! %vi-nl-total (vi+ %vi-nl-total (%vi-newlines-in start (vi+ start len))))
-            (%vi-undo-said "restored" len start)))
+      ((Undo deletion? type) (%vi-undo-said "restored" len start count))
       ((if (= type %vi-u-ins) #t (= type %vi-u-ins-chain))
-        (do (%vi-hole-delete! start (vi- (vi+ start len) 1) %vi-no-undo)
-            (%vi-undo-said "deleted" len start)))
-      (#t ()))
+        (%vi-undo-said "deleted" len start count))
+      (#t ()))))
+
+(def %vi-undo-landed
+  (fn (_ e)
+    (def type (first e))
     (if (if (= type %vi-u-del) #t (= type %vi-u-ins))
-      (do (set! %vi-dot start) (%vi-refresh! #f))
+      (do (set! %vi-dot (first (rest e))) (%vi-refresh! #f))
       ())))
 
 (def %vi-undo-said
-  (fn (_ what len start)
+  (fn (_ what len start count)
     (%vi-status-line!
       (%str-concat
-        (list "Undo [" (%vi-num->str %vi-modified) "] " what " " (%vi-num->str len)
+        (list "Undo [" (%vi-num->str count) "] " what " " (%vi-num->str len)
               " chars at position " (%vi-num->str start))))))
 
 ; --- . ----------------------------------------------------------------------

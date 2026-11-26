@@ -201,11 +201,8 @@
 ; the text is given one after it for the call.
 (def %vi-find-text-ic
   (fn (self from room pat len)
-    (def at
-      (%vi-found
-        (%vi-with-nul-at-end
-          (fn (_) (cu-ptr-call %vi-c-strcasestr (vi+ %vi-taddr from) pat)))))
-    (def nul (if (vi< at 0) (%vi-found (cu-ptr-call %vi-c-memchr (vi+ %vi-taddr from) 0 room)) -1))
+    (def at (%vi-buf find-any-case from pat))
+    (def nul (if (vi< at 0) (%vi-buf find-nul from room) -1))
     (match
       ((vi< -1 at) (if (vi< (vi+ from room) (vi+ at len)) -1 at))
       ((vi< nul 0) -1)
@@ -323,13 +320,3 @@
           (#t (= (vi+ bol (%vi-indent-len bol)) (%vi-end-line p))))
       (do (set! %vi-indentcol (%vi-get-column p)) p)
       (%vi-indent-reset p))))
-
-; THUNK's answer, with a NUL after the text while it runs: the byte there is
-; left as busybox would leave it, and put back after
-(def %vi-with-nul-at-end
-  (fn (_ thunk)
-    (def was (vi& (byte-at %vi-text %vi-end) 255))
-    (vi-ptr-set! %vi-tptr %vi-end 0 1)
-    (def r (thunk))
-    (vi-ptr-set! %vi-tptr %vi-end was 1)
-    r))
