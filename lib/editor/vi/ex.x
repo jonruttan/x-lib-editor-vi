@@ -34,7 +34,6 @@
     (if (if (vi< p stop) (vi< (vi- len 1) room) #f)
       (%vi-find-text p room pat len)
       -1)))
-(def %vi-found (fn (_ r) (if (= r 0) -1 (vi- r %vi-taddr))))
 
 ; the first PAT wholly in the ROOM bytes from FROM, or -1; with ignorecase,
 ; as busybox's strncasecmp, else byte for byte.  An empty PAT is found at
@@ -45,7 +44,7 @@
     (match
       ((= len 0) from)
       ((%vi-opt? %vi-ic) (%vi-find-text-ic from room pat len))
-      (#t (%vi-found (cu-ptr-call %vi-c-memmem (vi+ %vi-taddr from) room pat len))))))
+      (#t (%vi-buf find from room pat len)))))
 
 ; the last PAT starting at or after STOP and ending before P
 (def %vi-search-back
@@ -405,7 +404,7 @@
     (def more (vi- (vi- (length %vi-files) %vi-optind) 1))
     (match
       (force? (do (if (= c #\q) (set! %vi-optind (length %vi-files)) ()) (set! %vi-editing 0)))
-      ((vi< 0 %vi-modified)
+      ((vi< 0 (%vi-modified))
         (%vi-status-line-bold! (string-append "No write since last change (:" cmd "! overrides)")))
       ((if (= c #\q) (vi< 0 more) #f)
         (%vi-status-line-bold! (string-append (%vi-num->str more) " more file(s) to edit")))
@@ -416,7 +415,7 @@
 ; :rew -- back to the first file
 (def %vi-colon-rewind
   (fn (_ cmd force?)
-    (if (if (vi< 0 %vi-modified) (if force? #f #t) #f)
+    (if (if (vi< 0 (%vi-modified)) (if force? #f #t) #f)
       (%vi-status-line-bold! (string-append "No write since last change (:" cmd "! overrides)"))
       (do (set! %vi-optind -1) (set! %vi-editing 0)))))
 
@@ -473,7 +472,7 @@
 (def %vi-colon-edit
   (fn (_ cmd args force?)
     (match
-      ((if (vi< 0 %vi-modified) (if force? #f #t) #f)
+      ((if (vi< 0 (%vi-modified)) (if force? #f #t) #f)
         (%vi-status-line-bold! (string-append "No write since last change (:" cmd "! overrides)")))
       ((vi< 0 (byte-len args)) (%vi-expanded args %vi-edit-name))
       ((null? %vi-filename) (%vi-status-line-bold! "No current filename"))
@@ -540,7 +539,7 @@
 
 (def %vi-write-to
   (fn (_ cmd name force? q r)
-    (def write? (if (= %vi-modified 0) (if (= (%vi-byte-of cmd 0) #\x) #f #t) #t))
+    (def write? (if (= (%vi-modified) 0) (if (= (%vi-byte-of cmd 0) #\x) #f #t) #t))
     (def size (if write? (vi+ (vi- r q) 1) 0))
     (def l (if write? (if (null? name) -2 (%vi-file-write name q (vi+ r 1))) 0))
     (match
@@ -556,7 +555,7 @@
               (%vi-num->str (%vi-count-lines q (vi-max q (vi- (vi+ q l) 1)))) "L, "
               (%vi-num->str l) "C")))
     (if (= l size)
-      (do (if (if (= q 0) (= (vi+ q l) %vi-end) #f) (set! %vi-modified 0) ())
+      (do (if (if (= q 0) (= (vi+ q l) %vi-end) #f) (%vi-modified! 0) ())
           (%vi-written-ends cmd force?))
       ())))
 

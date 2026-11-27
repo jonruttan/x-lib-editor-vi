@@ -9,7 +9,8 @@
 ; busybox's vi (editors/vi.c) is the spec -- its screen, its keys, its
 ; messages -- and its shape is kept: one buffer of bytes, every line ending in
 ; a newline, with the cursor, the top of the screen and every range an offset
-; into it.  A motion is a search of that buffer, made by libc's memchr and
+; into it.  The buffer is editor/buffer's Buffer, and its undo editor/undo's
+; Undo.  A motion is a search of that buffer, made by libc's memchr and
 ; strcspn through the FFI: a byte loop in x costs hundreds of objects a byte,
 ; a libc call two.  Offsets and counts are small integers, so their arithmetic
 ; rides the integer doors, which allocate nothing where the tower's + and <
@@ -34,6 +35,10 @@
 (import x/sys/file)
 (import x/sys/opts)
 (import x/repl/term)
+(import editor/buffer Buffer buffer-find-newline buffer-newlines buffer-begin-line
+  buffer-end-line buffer-next-line buffer-prev-line buffer-next-lines buffer-prev-lines
+  buffer-count-lines buffer-plain-end buffer-lines-before)
+(import editor/undo Undo)
 
 ; --- the platform's calls, under the names the editor uses ---------------------
 
@@ -156,33 +161,15 @@
 
 ; libc's entry points, looked up at the start of each run: a handle is a fact
 ; of the process, and a state image is written by another one
-(def %vi-c-memchr ())
-(def %vi-c-memmove ())
-(def %vi-c-memcpy ())
-(def %vi-c-strcspn ())
 (def %vi-c-poll ())
-(def %vi-c-read ())
-(def %vi-c-write ())
 (def %vi-c-access ())
-(def %vi-c-memmem ())
-(def %vi-c-strcasestr ())
 (def %vi-c-system ())
-(def %vi-c-memset ())
 
 (def %vi-resolve!
   (fn (_)
-    (set! %vi-c-memchr (cu-libc-sym "memchr"))
-    (set! %vi-c-memmove (cu-libc-sym "memmove"))
-    (set! %vi-c-memcpy (cu-libc-sym "memcpy"))
-    (set! %vi-c-strcspn (cu-libc-sym "strcspn"))
     (set! %vi-c-poll (cu-libc-sym "poll"))
-    (set! %vi-c-read (cu-libc-sym "read"))
-    (set! %vi-c-write (cu-libc-sym "write"))
     (set! %vi-c-access (cu-libc-sym "access"))
-    (set! %vi-c-memmem (cu-libc-sym "memmem"))
-    (set! %vi-c-strcasestr (cu-libc-sym "strcasestr"))
-    (set! %vi-c-system (cu-libc-sym "system"))
-    (set! %vi-c-memset (cu-libc-sym "memset"))))
+    (set! %vi-c-system (cu-libc-sym "system"))))
 
 ; --- the terminal's words ---------------------------------------------------
 
@@ -205,10 +192,12 @@
 
 ; --- the editor's state, busybox's globals ----------------------------------
 
-(def %vi-text "")           ; the buffer, a string made raw
-(def %vi-tptr ())           ; its address as a pointer, for ptr set!
-(def %vi-taddr 0)           ; and as an integer, for libc
-(def %vi-room 0)            ; the bytes it holds, less one NUL never written
+; the text, an editor/buffer Buffer, and its undo, an editor/undo Undo, both
+; made at the start of each run: a Buffer holds its block's address, which a
+; state image can not carry.  Until then each holds its class.
+(def %vi-buf Buffer)
+(def %vi-u Undo)
+(def %vi-text "")           ; the buffer's block, read a byte at a time
 (def %vi-end 0)             ; the bytes of text in it
 (def %vi-dot 0)             ; the cursor
 (def %vi-screenbegin 0)     ; the first byte on the screen
@@ -224,7 +213,6 @@
 (def %vi-cmdcnt 0)
 (def %vi-cmd-error #f)
 (def %vi-editing 0)
-(def %vi-modified 0)
 (def %vi-readonly 0)         ; busybox's readonly_mode: 1 a file read-only, 2 -R; never cleared
 (def %vi-filename ())
 (def %vi-files ())
@@ -236,180 +224,100 @@
 (def %vi-screen ())         ; the text rows as last drawn, top first
 (def %vi-blanks "")         ; spaces enough for a row, sliced for padding
 (def %vi-out ())            ; output not yet written, last first
-(def %vi-nl-total 0)        ; the newlines in the text
-(def %vi-lc-pos 0)          ; a place in the text and the newlines before it
-(def %vi-lc-n 0)
 
 ; --- the text ---------------------------------------------------------------
 
-; ROOM bytes of buffer, spaces, with the NUL after them
-; a buffer of ROOM bytes, zeroed as busybox's xzalloc; growing it keeps all
-; of the old one, past the end too, as its realloc does -- the byte after
-; the text is what an edit left there, and busybox's cursor can read it
-(def %vi-text-room!
-  (fn (_ room)
-    (def old %vi-text)
-    (def old-room %vi-room)
-    (def old-end %vi-end)
-    (set! %vi-text (str-make-raw (vi+ room 1)))
-    (set! %vi-tptr (vi-str->ptr %vi-text))
-    (set! %vi-taddr (ptr->int %vi-tptr))
-    (cu-ptr-call %vi-c-memset %vi-taddr 0 (vi+ room 1))
-    (set! %vi-room room)
-    (if (vi< 0 old-end)
-      (cu-ptr-call %vi-c-memcpy %vi-taddr old (vi-min old-room room))
-      ())))
+; The text is the Buffer's.  A send to a Buffer or an Undo costs hundreds of
+; objects, and the redraw reads the text, its newlines and the change count on
+; every key, so vi keeps them: the Buffer's view is taken again after each
+; change made through it, and the change count is what each push answers.
+; The line walks are the Buffer's functions, called on the kept view.
+(def %vi-taddr 0)
+(def %vi-version 0)         ; the Buffer's change count, which the redraw asks every key
+(def %vi-nls 0)             ; the text's newlines
+(def %vi-sync!
+  (fn (_)
+    (def v (%vi-buf view))
+    (set! %vi-text (first v))
+    (set! %vi-taddr (first (rest v)))
+    (set! %vi-end (first (rest (rest v))))
+    (set! %vi-version (first (rest (rest (rest v)))))
+    (set! %vi-nls (first (rest (rest (rest (rest v))))))))
 
 (def %vi-text-init!
   (fn (_)
-    (set! %vi-end 0)
-    (%vi-text-room! 10240)
-    (vi-ptr-set! %vi-tptr 0 0 1)
+    (%vi-buf clear!)
+    (%vi-sync!)
     (set! %vi-dot 0)
-    (set! %vi-screenbegin 0)
-    (set! %vi-nl-total 0)
-    (%vi-touch! 0)
-    (%vi-lc-forget!)))
+    (set! %vi-screenbegin 0)))
 
-; the line-number cache holds for the text before %vi-lc-pos, so any change
-; there drops it; every change counts in %vi-text-version, which says whether
-; the rows the screen shows can have changed
-(def %vi-text-version 0)
-(def %vi-lc-forget!
-  (fn (_) (set! %vi-lc-pos 0) (set! %vi-lc-n 0)))
-(def %vi-touch!
-  (fn (_ p)
-    (set! %vi-text-version (vi+ %vi-text-version 1))
-    (if (vi< p %vi-lc-pos) (%vi-lc-forget!) ())))
+(def %vi-text-version (fn (_) %vi-version))
+(def %vi-mod 0)             ; the Undo's change count
+(def %vi-modified (fn (_) %vi-mod))
+(def %vi-modified! (fn (_ n) (set! %vi-mod n) (%vi-u modified! n)))
 
 ; busybox's text_hole_make: SIZE bytes of spaces opened at P
 (def %vi-hole-make!
-  (fn (_ p size)
-    (if (vi< 0 size)
-      (%vi-hole-open! p size (vi+ %vi-end size))
-      ())))
-
-(def %vi-hole-open!
-  (fn (_ p size new-end)
-    (if (vi< %vi-room new-end)
-      (%vi-text-room! (vi+ new-end 10240))
-      ())
-    (%vi-touch! p)
-    (cu-ptr-call %vi-c-memmove (vi+ %vi-taddr (vi+ p size)) (vi+ %vi-taddr p)
-      (vi- %vi-end p))
-    (set! %vi-end new-end)
-    (cu-ptr-call %vi-c-memset (vi+ %vi-taddr p) 32 size)))
+  (fn (_ p size) (%vi-buf open! p size) (%vi-sync!)))
 
 ; one byte of the text replaced, the newline count kept
 (def %vi-byte-set!
-  (fn (_ p b)
-    (def was (byte-at %vi-text p))
-    (if (= was #\newline) (set! %vi-nl-total (vi- %vi-nl-total 1)) ())
-    (if (= b #\newline) (set! %vi-nl-total (vi+ %vi-nl-total 1)) ())
-    (%vi-touch! p)
-    (vi-ptr-set! %vi-tptr p b 1)))
+  (fn (_ p b) (%vi-buf byte-set! p b) (%vi-sync!)))
 
 ; busybox's text_hole_delete: P through Q, both kept, answering where the text
 ; after them now starts; UNDO says how it may be undone.  The count drops by
 ; one here and comes back when the bytes go, so only the record counts.
 (def %vi-hole-delete!
   (fn (_ p q undo)
-    (def src (if (vi< q p) (vi+ p 1) (vi+ q 1)))
-    (def dest (if (vi< q p) q p))
     (%vi-undo-push-delete! p (vi+ (vi- q p) 1) undo)
-    (set! %vi-modified (vi- %vi-modified 1))
-    (match
-      ((vi< %vi-end src) dest)
-      ((vi< dest 0) dest)
-      ((vi< dest %vi-end) (%vi-hole-close! dest src))
-      (#t dest))))
-
-(def %vi-hole-close!
-  (fn (_ dest src)
-    (set! %vi-modified (vi+ %vi-modified 1))
-    (set! %vi-nl-total (vi- %vi-nl-total (%vi-newlines-in dest src)))
-    (%vi-touch! dest)
-    (if (vi< src %vi-end)
-      (cu-ptr-call %vi-c-memmove (vi+ %vi-taddr dest) (vi+ %vi-taddr src)
-        (vi- %vi-end src))
-      ())
-    (set! %vi-end (vi- %vi-end (vi- src dest)))
-    (match
-      ((vi< %vi-end 1) (do (set! %vi-end 0) 0))
-      ((vi< dest %vi-end) dest)
-      (#t (vi- %vi-end 1)))))
+    (if (%vi-buf closes? p q) () (%vi-modified! (vi- %vi-mod 1)))
+    (def at (%vi-buf delete! p q))
+    (%vi-sync!)
+    at))
 
 ; the byte C put in at P, as busybox's stupid_insert: its caller records it
 (def %vi-byte-insert!
-  (fn (_ p c)
-    (%vi-hole-make! p 1)
-    (%vi-byte-set! p c)))
+  (fn (_ p c) (%vi-buf insert-byte! p c) (%vi-sync!)))
 
 ; --- lines ------------------------------------------------------------------
 
-; the first newline in [A, B), or -1
-(def %vi-find-nl
-  (fn (_ a b)
-    (if (vi< a b)
-      (%vi-nl-found (cu-ptr-call %vi-c-memchr (vi+ %vi-taddr a) 10 (vi- b a)))
-      -1)))
-(def %vi-nl-found (fn (_ r) (if (= r 0) -1 (vi- r %vi-taddr))))
-
-; the newlines in [A, B)
-(def %vi-newlines-in
-  (fn (_ a b) (%vi-newlines-from a b 0)))
-(def %vi-newlines-from
-  (fn (self a b n)
-    (def at (%vi-find-nl a b))
-    (if (= at -1) n (self (vi+ at 1) b (vi+ n 1)))))
-
-; the last newline in [LO, HI), or FOUND
-(def %vi-last-nl-in
-  (fn (self lo hi found)
-    (def at (%vi-find-nl lo hi))
-    (if (= at -1) found (self (vi+ at 1) hi at))))
-
-; the last newline before P, or -1: libc has no backward memchr everywhere,
-; so the text before P is searched forward, 128 bytes at a time from P back
-(def %vi-nl-before
-  (fn (self p)
-    (def lo (if (vi< p 128) 0 (vi- p 128)))
-    (def at (%vi-last-nl-in lo p -1))
-    (match
-      ((vi< -1 at) at)
-      ((= lo 0) -1)
-      (#t (self lo)))))
-
-(def %vi-begin-line
-  (fn (_ p) (if (vi< 0 p) (vi+ (%vi-nl-before p) 1) p)))
-
-(def %vi-end-line
+; the buffer's walks over vi's cached view of it, called as functions: a send
+; on every motion costs hundreds of objects
+(def %vi-find-nl (fn (_ a b) (buffer-find-newline %vi-taddr a b)))
+(def %vi-newlines-in (fn (_ a b) (buffer-newlines %vi-taddr a b)))
+(def %vi-begin-line (fn (_ p) (buffer-begin-line %vi-taddr p)))
+(def %vi-end-line (fn (_ p) (buffer-end-line %vi-taddr %vi-end p)))
+(def %vi-prev-line (fn (_ p) (buffer-prev-line %vi-text %vi-taddr p)))
+(def %vi-next-line (fn (_ p) (buffer-next-line %vi-text %vi-taddr %vi-end p)))
+(def %vi-next-lines (fn (_ p n) (buffer-next-lines %vi-text %vi-taddr %vi-end p n)))
+(def %vi-prev-lines (fn (_ p n) (buffer-prev-lines %vi-text %vi-taddr p n)))
+(def %vi-count-lines (fn (_ start stop) (buffer-count-lines %vi-taddr %vi-end start stop)))
+; the newlines before P, counted from the place asked last; the Buffer is
+; asked only once the text has changed since
+(def %vi-lc-version -1)
+(def %vi-lc-pos 0)
+(def %vi-lc-n 0)
+(def %vi-lines-before
   (fn (_ p)
-    (def last (vi- %vi-end 1))
-    (if (vi< p last)
-      (%vi-end-line-at (%vi-find-nl p last) last)
-      p)))
-(def %vi-end-line-at (fn (_ at last) (if (= at -1) last at)))
+    (def k
+      (if (= %vi-lc-version %vi-version)
+        (buffer-lines-before %vi-taddr %vi-lc-pos %vi-lc-n p)
+        (%vi-buf lines-before p)))
+    (set! %vi-lc-version %vi-version)
+    (set! %vi-lc-pos p)
+    (set! %vi-lc-n k)
+    k))
+(def %vi-find-line (fn (_ li) (%vi-buf find-line li)))
 
-(def %vi-prev-line
-  (fn (_ p)
-    (def b (%vi-begin-line p))
-    (%vi-begin-line
-      (if (if (vi< 0 b) (= (byte-at %vi-text (vi- b 1)) #\newline) #f) (vi- b 1) b))))
-
-(def %vi-next-line
-  (fn (_ p)
-    (def e (%vi-end-line p))
-    (if (if (vi< e (vi- %vi-end 1)) (= (byte-at %vi-text e) #\newline) #f) (vi+ e 1) e)))
 
 (def %vi-end-screen
   (fn (_)
-    (if (if (= %vi-es-version %vi-text-version)
+    (if (if (= %vi-es-version (%vi-text-version))
           (if (= %vi-es-top %vi-screenbegin) (= %vi-es-rows %vi-rows) #f)
           #f)
       %vi-es-at
       (do (set! %vi-es-at (%vi-end-line (%vi-next-lines %vi-screenbegin (vi- %vi-rows 2))))
-          (set! %vi-es-version %vi-text-version)
+          (set! %vi-es-version (%vi-text-version))
           (set! %vi-es-top %vi-screenbegin)
           (set! %vi-es-rows %vi-rows)
           %vi-es-at))))
@@ -419,33 +327,6 @@
 (def %vi-es-version -1)
 (def %vi-es-top -1)
 (def %vi-es-rows -1)
-
-(def %vi-next-lines
-  (fn (self p n) (if (vi< 0 n) (self (%vi-next-line p) (vi- n 1)) p)))
-
-; busybox's count_lines: the newlines from START through the end of STOP's
-; line, never past the text's last byte
-(def %vi-count-lines
-  (fn (_ start stop)
-    (if (vi< stop start)
-      (%vi-count-lines-from stop start)
-      (%vi-count-lines-from start stop))))
-(def %vi-count-lines-from
-  (fn (_ a b) (%vi-newlines-in a (vi-min (vi+ (%vi-end-line b) 1) %vi-end))))
-
-; the newlines before P, counted from the cached place nearest it
-(def %vi-lines-before
-  (fn (_ p)
-    (def n
-      (if (vi< p %vi-lc-pos)
-        (vi- %vi-lc-n (%vi-newlines-in p %vi-lc-pos))
-        (vi+ %vi-lc-n (%vi-newlines-in %vi-lc-pos p))))
-    (set! %vi-lc-pos p)
-    (set! %vi-lc-n n)
-    n))
-
-; busybox's find_line: where line LI starts, counting from 1
-(def %vi-find-line (fn (_ li) (%vi-next-lines 0 (vi- li 1))))
 
 ; --- columns ----------------------------------------------------------------
 
@@ -464,7 +345,7 @@
 ; where the bytes shown as themselves end, from A on
 (def %vi-plain-end
   (fn (_ a)
-    (vi+ a (cu-ptr-call %vi-c-strcspn (vi+ %vi-taddr a) %vi-reject))))
+    (buffer-plain-end %vi-taddr a %vi-reject)))
 
 ; the column after the bytes [A, P), from column CO
 (def %vi-columns-over
@@ -650,9 +531,6 @@
       (set! %vi-screenbegin (%vi-prev-lines %vi-screenbegin half))
       ())))
 
-(def %vi-prev-lines
-  (fn (self p n) (if (vi< 0 n) (self (%vi-prev-line p) (vi- n 1)) p)))
-
 (def %vi-scroll-down-to!
   (fn (_ beg end-scr)
     (if (vi< end-scr beg)
@@ -712,7 +590,7 @@
           (set! %vi-drawn-sy (if (null? sy) #f #t))
           (set! %vi-drawn-theme (if (null? sy) () (Theme current)))
           (set! %vi-drawn-screen %vi-screen)
-          (set! %vi-drawn-version %vi-text-version)
+          (set! %vi-drawn-version (%vi-text-version))
           (set! %vi-drawn-top %vi-screenbegin)
           (set! %vi-drawn-tabstop %vi-tabstop)))
     (%vi-place-cursor %vi-crow %vi-ccol)
@@ -724,7 +602,7 @@
     (match
       (force #f)
       ((not (eq? %vi-screen %vi-drawn-screen)) #f)
-      ((not (= %vi-text-version %vi-drawn-version)) #f)
+      ((not (= (%vi-text-version) %vi-drawn-version)) #f)
       ((not (= %vi-screenbegin %vi-drawn-top)) #f)
       (#t (= %vi-tabstop %vi-drawn-tabstop)))))
 
@@ -738,8 +616,9 @@
 (def %vi-row-next
   (fn (_ tp)
     (if (vi< tp %vi-end)
-      (vi+ (%vi-end-line-at (%vi-find-nl tp %vi-end) (vi- %vi-end 1)) 1)
+      (vi+ (%vi-row-end (%vi-find-nl tp %vi-end)) 1)
       tp)))
+(def %vi-row-end (fn (_ at) (if (= at -1) (vi- %vi-end 1) at)))
 
 ; busybox's refresh, a row at a time: what differs from the row on the
 ; screen, from its first differing column to its last, or all of it when
@@ -848,13 +727,13 @@
     (def eol (%vi-end-line %vi-dot))
     (def cur (%vi-lines-before (vi+ eol 1)))
     (def before (if (= (byte-at %vi-text eol) #\newline) (vi- cur 1) cur))
-    (def tot (vi- (vi+ cur (vi- %vi-nl-total before)) 1))
+    (def tot (vi- (vi+ cur (vi- %vi-nls before)) 1))
     (def s
       (string-append
         (vi-bsub "-IR-" (vi% %vi-cmd-mode 4) 1) " "
         (if (null? %vi-filename) "No file" %vi-filename)
         (if (= %vi-readonly 0) "" " [Readonly]")
-        (if (= %vi-modified 0) "" " [Modified]")
+        (if (= (%vi-modified) 0) "" " [Modified]")
         " " (%vi-num->str (if (vi< 0 tot) cur 0))
         "/" (%vi-num->str (if (vi< 0 tot) tot 0))
         " " (%vi-num->str (if (vi< 0 tot) (vi/ (%vi* 100 cur) tot) 100))
@@ -1665,7 +1544,7 @@
     (match
       ((= c #\Q) (do (set! %vi-editing 0) (set! %vi-optind (length %vi-files))))
       ((if (= c #\Z) #f #t) (%vi-indicate-error))
-      ((= %vi-modified 0) (%vi-zz-ends))
+      ((= (%vi-modified) 0) (%vi-zz-ends))
       ((if (= %vi-readonly 0) #f (if (null? %vi-filename) #f #t))
         (%vi-status-line-bold! (string-append "'" %vi-filename "' is read only")))
       (#t (%vi-zz-written (%vi-file-write %vi-filename 0 %vi-end))))))
@@ -1681,7 +1560,7 @@
   (fn (_)
     (def more (vi- (vi- (length %vi-files) %vi-optind) 1))
     (if (vi< 0 more)
-      (do (set! %vi-modified 0)
+      (do (%vi-modified! 0)
           (%vi-status-line-bold! (string-append (%vi-num->str more) " more file(s) to edit")))
       (set! %vi-editing 0))))
 
@@ -1708,16 +1587,7 @@
     n))
 
 (def %vi-write-all
-  (fn (self fd at left done)
-    (if (vi< 0 left)
-      (%vi-wrote self fd at left done
-        (cu-ptr-call %vi-c-write fd (vi+ %vi-taddr at) left))
-      done)))
-(def %vi-wrote
-  (fn (_ again fd at left done r)
-    (if (vi< 0 r)
-      (again fd (vi+ at r) (vi- left r) (vi+ done r))
-      done)))
+  (fn (_ fd at left done) (vi+ done (%vi-buf write-to fd at (vi+ at left)))))
 
 ; busybox's file_insert: NAME's bytes put in at P; answers the count read, or
 ; -1 when it could not be opened.  The first file read is read-only when it
@@ -1748,24 +1618,12 @@
 
 (def %vi-read-in
   (fn (_ fd p size name)
-    (%vi-hole-make! p size)
-    (def cnt (%vi-read-all fd p size 0))
+    (def cnt (%vi-buf read! fd p size))
+    (%vi-sync!)
     (if (vi< cnt size)
-      (do (%vi-hole-delete! (vi+ p cnt) (vi- (vi+ p size) 1) %vi-no-undo)
-          (%vi-status-line-bold! (string-append "can't read '" name "'")))
+      (%vi-status-line-bold! (string-append "can't read '" name "'"))
       (%vi-undo-push-insert! p size %vi-allow-undo))
-    (set! %vi-nl-total (vi+ %vi-nl-total (%vi-newlines-in p (vi+ p cnt))))
     cnt))
-
-(def %vi-read-all
-  (fn (self fd at left done)
-    (if (vi< 0 left)
-      (%vi-read-got self fd at left done
-        (cu-ptr-call %vi-c-read fd (vi+ %vi-taddr at) left))
-      done)))
-(def %vi-read-got
-  (fn (_ again fd at left done r)
-    (if (vi< 0 r) (again fd (vi+ at r) (vi- left r) (vi+ done r)) done)))
 
 ; busybox's init_text_buffer: the text is NAME's, or one empty line
 (def vi-init-text-buffer!
@@ -1777,7 +1635,7 @@
       (%vi-char-insert %vi-end 10 %vi-no-undo)
       ())
     (%vi-undo-flush!)
-    (set! %vi-modified 0)
+    (%vi-modified! 0)
     (set! %vi-marks (Vector make 28 -1))
     rc))
 
