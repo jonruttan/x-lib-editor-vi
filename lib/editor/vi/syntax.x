@@ -24,7 +24,6 @@
 
 
 (def %vi-cells ())         ; the cell rows as last drawn, beside %vi-screen
-(def %vi-cells-screen ())  ; the %vi-screen those cell rows were drawn with
 (def %vi-drawn-sy #f)      ; whether the rows were drawn in colour
 (def %vi-drawn-theme ())   ; the Theme they were drawn in, nil for none
 
@@ -44,7 +43,6 @@
 (def %vi-syntax-init!
   (fn (_)
     (set! %vi-cells ())
-    (set! %vi-cells-screen ())
     (set! %vi-drawn-sy #f)
     (set! %vi-drawn-theme ())
     (set! %vi-grammar-name ())
@@ -155,59 +153,21 @@
 
 ; --- drawing ----------------------------------------------------------------
 
-; busybox's refresh, a row at a time, with each row's cells: what differs in
-; the text or the cells, from the first differing column to the last, or all
-; of it when forced.  Answers the rows, and leaves their cells in %vi-cells.
-(def %vi-refresh-rows-sy
-  (fn (_ g force)
+; the rows the screen shows, as %vi-format-rows lays them out, with each
+; row's cells left in %vi-cells for the Pane
+(def %vi-format-rows-sy
+  (fn (_ g)
     (%vi-region! g)
-    (def olds (if (eq? %vi-screen %vi-cells-screen) %vi-cells ()))
-    (def r (%vi-rows-sy %vi-screenbegin 0 %vi-screen olds force () ()))
+    (def r (%vi-rows-sy %vi-screenbegin 0 () ()))
     (set! %vi-cells (rest r))
     (first r)))
 
 (def %vi-rows-sy
-  (fn (self tp li old oldc force acc accc)
+  (fn (self tp li acc accc)
     (if (vi< li (vi- %vi-rows 1))
-      (let ((row (%vi-format-line tp)) (cells (%vi-format-cells tp)))
-        (%vi-row-drawn-sy li row cells old (if (null? oldc) () (first oldc)) force)
-        (self (%vi-row-next tp) (vi+ li 1) (if (null? old) () (rest old))
-          (if (null? oldc) () (rest oldc)) force (pair row acc) (pair cells accc)))
+      (self (%vi-row-next tp) (vi+ li 1)
+        (pair (%vi-format-line tp) acc) (pair (%vi-format-cells tp) accc))
       (pair (reverse acc) (reverse accc)))))
 
-(def %vi-row-drawn-sy
-  (fn (_ li row cells old oldc force)
-    (def oc (if (null? oldc) (%vi-spaces %vi-columns) oldc))
-    (def last (vi- (byte-len row) 1))
-    (match
-      ((if force #t (null? old)) (%vi-span-sy li row cells 0 last))
-      ((string=? row (first old))
-        (if (string=? cells oc) ()
-          (%vi-span-sy li row cells (%vi-first-diff cells oc 0) (%vi-last-diff cells oc last))))
-      ((string=? cells oc)
-        (%vi-span-sy li row cells (%vi-first-diff row (first old) 0) (%vi-last-diff row (first old) last)))
-      (#t (%vi-span-sy li row cells
-            (vi-min (%vi-first-diff row (first old) 0) (%vi-first-diff cells oc 0))
-            (vi-max (%vi-last-diff row (first old) last) (%vi-last-diff cells oc last)))))))
-
-(def %vi-span-sy
-  (fn (_ li row cells cs ce)
-    (%vi-place-cursor li cs)
-    (%vi-put-runs row cells cs (vi+ ce 1))))
-
-; the columns [I, E) of ROW, each run of one class in its sequence and a reset
-(def %vi-put-runs
-  (fn (self row cells i e)
-    (if (vi< i e)
-      (let ((j (%vi-run-end cells (byte-at cells i) (vi+ i 1) e)))
-        (def text (vi-bsub row i (vi- j i)))
-        (def sgr (if (= (byte-at cells i) #\space) "" (Syntax sgr (Syntax cell-class (byte-at cells i)))))
-        (%vi-put (if (= (byte-len sgr) 0) text (string-append sgr text %vi-sgr-reset)))
-        (self row cells j e))
-      ())))
-
-(def %vi-run-end
-  (fn (self cells c i e)
-    (if (if (vi< i e) (= (byte-at cells i) c) #f) (self cells c (vi+ i 1) e) i)))
-
-(def %vi-sgr-reset (string-append %vi-esc "[0m"))
+; a cell's class byte as its SGR sequence, in the theme now current
+(def %vi-cell-sgr (fn (_ c) (Syntax sgr (Syntax cell-class c))))
