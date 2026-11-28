@@ -390,7 +390,7 @@
     (match
       ((if (vi< r q) #t (vi< 188 (%vi-list-len acc 0))) acc)
       ((= c #\newline) (pair "$" acc))
-      ((vi< #\delete c) (self (vi+ q 1) r (pair (string-append %vi-bold "." %vi-norm) acc)))
+      ((vi< #\delete c) (self (vi+ q 1) r (pair (Pane reverse ".") acc)))
       (#t (self (vi+ q 1) r (pair (%vi-literal-byte c) acc))))))
 
 (def %vi-list-len

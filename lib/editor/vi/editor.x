@@ -39,6 +39,8 @@
   buffer-end-line buffer-next-line buffer-prev-line buffer-next-lines buffer-prev-lines
   buffer-count-lines buffer-plain-end buffer-lines-before)
 (import editor/undo Undo)
+(import editor/keys Keys)
+(import editor/screen Pane pane-goto)
 
 ; --- the platform's calls, under the names the editor uses ---------------------
 
@@ -174,13 +176,7 @@
 ; --- the terminal's words ---------------------------------------------------
 
 (def %vi-esc (bytes->str (list 27)))
-(def %vi-bell (bytes->str (list 7)))
-(def %vi-bold (string-append %vi-esc "[7m"))
-(def %vi-norm (string-append %vi-esc "[m"))
-(def %vi-clear-eol (string-append %vi-esc "[K"))
-(def %vi-home-clear (string-append %vi-esc "[H" %vi-esc "[J"))
-(def %vi-alt-on (string-append %vi-esc "[?1049h"))
-(def %vi-alt-off (string-append %vi-esc "[?1049l"))
+(def %vi-bell (Pane bell))
 
 ; the bytes a screen line shows as something other than themselves: the
 ; controls, which show as ^X or a tab's spaces, and the bytes past 0x7F, which
@@ -404,12 +400,16 @@
       (do (%vi-sink (%str-concat (reverse %vi-out)))
           (set! %vi-out ())))))
 
+; The screen is editor/screen's Pane, ROWS by COLUMNS from the corner
+; (%vi-p-top, %vi-p-left): vi's rows and columns count from there.  Its
+; escapes go into the output above.
+(def %vi-pane Pane)
+(def %vi-p-top 0)
+(def %vi-p-left 0)
+
 (def %vi-place-cursor
   (fn (_ row col)
-    (def r (vi-max 0 (vi-min row (vi- %vi-rows 1))))
-    (def c (vi-max 0 (vi-min col (vi- %vi-columns 1))))
-    (%vi-put (string-append %vi-esc "[" (%vi-num->str (vi+ r 1)) ";"
-                            (%vi-num->str (vi+ c 1)) "H"))))
+    (%vi-put (pane-goto %vi-p-top %vi-p-left %vi-rows %vi-columns row col))))
 
 ; N in decimal, by the integer doors: the general number's arithmetic
 ; allocates at every step, and this runs several times a key
@@ -427,7 +427,7 @@
 (def %vi-bottom-clear
   (fn (_)
     (%vi-place-cursor (vi- %vi-rows 1) 0)
-    (%vi-put %vi-clear-eol)))
+    (%vi-put (%vi-pane clear-eol (vi- %vi-rows 1) 0))))
 
 (def %vi-indicate-error
   (fn (_)
@@ -446,7 +446,9 @@
     (set! %vi-blanks (str-make-raw (vi+ %vi-columns 16)))
     (def blank (%vi-spaces %vi-columns))
     (def tilde (string-append "~" (%vi-spaces (vi- %vi-columns 1))))
-    (set! %vi-screen (pair blank (%vi-rows-of tilde (vi- %vi-rows 2) ())))))
+    (set! %vi-screen (pair blank (%vi-rows-of tilde (vi- %vi-rows 2) ())))
+    (%vi-pane resize! %vi-rows %vi-columns)
+    (%vi-pane reset! %vi-screen)))
 
 (def %vi-rows-of
   (fn (self s n acc) (if (vi< 0 n) (self s (vi- n 1) (pair s acc)) acc)))
@@ -454,7 +456,8 @@
 (def %vi-screen-erase!
   (fn (_)
     (set! %vi-screen
-      (%vi-rows-of (%vi-spaces %vi-columns) (vi- %vi-rows 1) ()))))
+      (%vi-rows-of (%vi-spaces %vi-columns) (vi- %vi-rows 1) ()))
+    (%vi-pane reset! %vi-screen)))
 
 ; busybox's format_line: the row the line at SRC shows, COLUMNS wide, from
 ; the column %vi-offset; a row past the text shows a ~
@@ -583,10 +586,10 @@
     (if (%vi-rows-current? (if full #t moved)) ()
       (do (set! %vi-screen
             (if (null? sy)
-              (%vi-refresh-rows %vi-screenbegin 0 %vi-screen (if full #t moved) ())
-              (%vi-refresh-rows-sy sy (if full #t moved))))
+              (%vi-format-rows %vi-screenbegin 0 ())
+              (%vi-format-rows-sy sy)))
           (if (null? sy) (set! %vi-cells ()) ())
-          (set! %vi-cells-screen %vi-screen)
+          (%vi-put (%vi-pane draw! %vi-screen %vi-cells (if full #t moved)))
           (set! %vi-drawn-sy (if (null? sy) #f #t))
           (set! %vi-drawn-theme (if (null? sy) () (Theme current)))
           (set! %vi-drawn-screen %vi-screen)
@@ -606,11 +609,11 @@
       ((not (= %vi-screenbegin %vi-drawn-top)) #f)
       (#t (= %vi-tabstop %vi-drawn-tabstop)))))
 
-(def %vi-refresh-rows
-  (fn (self tp li old force acc)
+; the rows the screen shows from the line at TP, all but the bottom one
+(def %vi-format-rows
+  (fn (self tp li acc)
     (if (vi< li (vi- %vi-rows 1))
-      (self (%vi-row-next tp) (vi+ li 1) (if (null? old) () (rest old)) force
-        (pair (%vi-row-drawn li (%vi-format-line tp) old force) acc))
+      (self (%vi-row-next tp) (vi+ li 1) (pair (%vi-format-line tp) acc))
       (reverse acc))))
 
 (def %vi-row-next
@@ -619,30 +622,6 @@
       (vi+ (%vi-row-end (%vi-find-nl tp %vi-end)) 1)
       tp)))
 (def %vi-row-end (fn (_ at) (if (= at -1) (vi- %vi-end 1) at)))
-
-; busybox's refresh, a row at a time: what differs from the row on the
-; screen, from its first differing column to its last, or all of it when
-; forced
-(def %vi-row-drawn
-  (fn (_ li row old force)
-    (match
-      ((if force #t (null? old)) (do (%vi-place-cursor li 0) (%vi-put row)))
-      ((string=? row (first old)) ())
-      (#t (%vi-row-span li row (first old) (%vi-first-diff row (first old) 0))))
-    row))
-
-(def %vi-row-span
-  (fn (_ li row old cs)
-    (def ce (%vi-last-diff row old (vi- (byte-len row) 1)))
-    (%vi-place-cursor li cs)
-    (%vi-put (vi-bsub row cs (vi+ (vi- ce cs) 1)))))
-
-(def %vi-first-diff
-  (fn (self a b i)
-    (if (= (byte-at a i) (byte-at b i)) (self a b (vi+ i 1)) i)))
-(def %vi-last-diff
-  (fn (self a b i)
-    (if (= (byte-at a i) (byte-at b i)) (self a b (vi- i 1)) i)))
 
 ; the window as the terminal reports it, (columns . rows), or nil when it
 ; reports nothing
@@ -700,13 +679,13 @@
     (%vi-flush!)
     (def k (if (%vi-src-ready? 100) (%vi-read-key) ()))
     (if (if (null? k) #f (= k %vi-key-cursor-pos))
-      (do (set! %vi-rows (vi-min (first %vi-cursor-reply) 4096))
-          (set! %vi-columns (vi-min (rest %vi-cursor-reply) 4096)))
+      (do (set! %vi-rows (vi-min (first (%vi-kb cursor-reply)) 4096))
+          (set! %vi-columns (vi-min (rest (%vi-kb cursor-reply)) 4096)))
       ())))
 
 (def %vi-redraw!
   (fn (_ full?)
-    (%vi-put %vi-home-clear)
+    (%vi-put (%vi-pane clear))
     (%vi-screen-erase!)
     (set! %vi-last-status ())
     (%vi-refresh! full?)
@@ -776,7 +755,7 @@
     (set! %vi-last-status (if msg? () (%vi-bufsum s)))
     (set! %vi-bottom s)
     (%vi-bottom-clear)
-    (%vi-put (if (= %vi-have-status 2) (string-append %vi-bold s %vi-norm) s))
+    (%vi-put (if (= %vi-have-status 2) (Pane reverse s) s))
     (if msg? (%vi-status-shown! s) ())
     (%vi-place-cursor %vi-crow %vi-ccol)))
 
@@ -791,7 +770,7 @@
 (def %vi-hit-return
   (fn (_ s)
     (set! %vi-bottom (string-append s "[Hit return to continue]"))
-    (%vi-put (string-append %vi-bold "[Hit return to continue]" %vi-norm))
+    (%vi-put (Pane reverse "[Hit return to continue]"))
     (%vi-until-return)
     (%vi-redraw! #t)))
 
@@ -830,7 +809,6 @@
 ; end; READY? answers whether one comes within MS milliseconds
 (def %vi-src-read ())
 (def %vi-src-ready? ())
-(def %vi-kbuf ())           ; bytes read after an Escape and not yet used
 
 ; the signals busybox's handlers catch: ARRIVED? answers whether one ('winch
 ; or 'tstp) came since it was last asked; STOP! stops the process until it is
@@ -838,156 +816,50 @@
 (def %vi-arrived? ())
 (def %vi-stop! ())
 
-; busybox's escape sequences (libbb/read_key.c), each with its key code
-(def vi-key-up -2)
-(def vi-key-down -3)
-(def %vi-key-right -4)
-(def %vi-key-left -5)
-(def vi-key-home -6)
-(def vi-key-end -7)
-(def %vi-key-insert -8)
-(def %vi-key-delete -9)
-(def vi-key-page-up -10)
-(def vi-key-page-down -11)
-
-; the terminal's answer to where its cursor is, ESC [ ROW ; COL R; the
-; numbers in %vi-cursor-reply, (ROW . COL)
-(def %vi-key-cursor-pos -256)
-(def %vi-cursor-reply ())
-
-; each sequence as the bytes after the Escape, with its code; shortest first,
-; as busybox orders them
-(def vi-sequences
-  (list (pair (bytes->str (list 127)) -44) (pair (bytes->str (list 8)) -44)
-        (pair "d" -45) (pair "f" -36) (pair "b" -37)
-        (pair "OA" -2) (pair "OB" -3) (pair "OC" -4) (pair "OD" -5)
-        (pair "OH" -6) (pair "OF" -7)
-        (pair "[A" -2) (pair "[B" -3) (pair "[C" -4) (pair "[D" -5)
-        (pair "[H" -6) (pair "[F" -7)
-        (pair "[1~" -6) (pair "[2~" -8) (pair "[3~" -9) (pair "[4~" -7)
-        (pair "[5~" -10) (pair "[6~" -11) (pair "[7~" -6) (pair "[8~" -7)
-        (pair "[1;3C" -36) (pair "[1;3D" -37)
-        (pair "[1;5C" -68) (pair "[1;5D" -69)))
-
-; the next byte: one read after an Escape first
-(def %vi-next-byte
+; The keys are editor/keys' Keys, busybox's read_key, over the bytes above;
+; the output waiting is written before a read blocks.  Keys holds a byte
+; back only after it answers an Escape, so only then is it asked whether a
+; key waits.
+(def %vi-kb Keys)
+(def %vi-esc-held #f)        ; whether the last key Keys answered was an Escape
+; the keys and the screen, made at the start of each run: the Keys' readers
+; and the Pane's colours are this run's
+(def %vi-io-make!
   (fn (_)
-    (if (null? %vi-kbuf)
-      (do (%vi-flush!) (%vi-src-read))
-      (%vi-pop-kbuf))))
-(def %vi-pop-kbuf
-  (fn (_) (def b (first %vi-kbuf)) (set! %vi-kbuf (rest %vi-kbuf)) b))
+    (set! %vi-kb
+      (Keys make (fn (_) (%vi-flush!) (%vi-src-read)) (fn (_ ms) (%vi-src-ready? ms))))
+    (set! %vi-esc-held #f)
+    (set! %vi-pane ((Pane make ()) colour! %vi-cell-sgr))
+    (set! %vi-p-top 0)
+    (set! %vi-p-left 0)))
+
+; busybox's key codes
+(def vi-key-up (Keys up))
+(def vi-key-down (Keys down))
+(def %vi-key-right (Keys right))
+(def %vi-key-left (Keys left))
+(def vi-key-home (Keys home))
+(def vi-key-end (Keys end))
+(def %vi-key-insert (Keys insert))
+(def %vi-key-delete (Keys delete))
+(def vi-key-page-up (Keys page-up))
+(def vi-key-page-down (Keys page-down))
+(def %vi-key-cursor-pos (Keys cursor-report))
+(def vi-sequences (Keys sequences))
 
 ; busybox's read_key: a byte, or the code of a known escape sequence; nil at
 ; the end of the input
 (def %vi-read-key
-  (fn (self)
-    (def c (%vi-next-byte))
-    (match
-      ((null? c) ())
-      ((= c #\escape) (%vi-escape self))
-      (#t c))))
+  (fn (_)
+    (def c (%vi-kb key))
+    (set! %vi-esc-held (if (null? c) #f (= c 27)))
+    c))
 
-; After an Escape the sequences are tried in order, each further byte waited
-; for 50 ms.  A lone Escape, or one with a single byte after it, is the Escape
-; key and the byte is kept; a longer run nobody knows is dropped and the next
-; key read instead.  The bytes already read after it (%vi-kbuf) are where the
-; matching starts, in the order they came.
-(def %vi-escape
-  (fn (_ again)
-    (def got (%vi-seq-match vi-sequences (%vi-list->str %vi-kbuf)))
-    (set! %vi-kbuf ())
-    (match
-      ((null? got) ())
-      ((number? got) got)
-      ((null? (rest got)) (%vi-escape-rest again (%vi-drain (first got))))
-      (#t (%vi-escape-rest again (first got))))))
-
-; a code on a match; (BUF) when no sequence matched with the bytes BUF; (BUF .
-; stop) when the bytes stopped coming first; nil at the end of the input
-(def %vi-seq-match
-  (fn (self seqs buf)
-    (if (null? seqs) (list buf)
-      (%vi-seq-try self seqs buf 0))))
-
-(def %vi-seq-try
-  (fn (_ walk seqs buf i)
-    (def want (first (first seqs)))
-    (match
-      ((= i (byte-len want)) (rest (first seqs)))
-      ((vi< i (byte-len buf))
-        (if (= (byte-at buf i) (byte-at want i))
-          (%vi-seq-try walk seqs buf (vi+ i 1))
-          (walk (rest seqs) buf)))
-      ((%vi-src-ready? 50) (%vi-seq-read walk seqs buf i))
-      (#t (pair buf (lit stop))))))
-
-(def %vi-seq-read
-  (fn (_ walk seqs buf i)
-    (def b (%vi-src-read))
-    (if (null? b) ()
-      (%vi-seq-try walk seqs (string-append buf (bytes->str (list b))) i))))
-
-; no sequence matched: more bytes read while they come, up to busybox's 15,
-; each one read making the run a cursor report if it now is one
-(def %vi-drain
-  (fn (self buf)
-    (if (if (vi< (byte-len buf) 15) (%vi-src-ready? 50) #f)
-      (%vi-drained self buf (%vi-src-read))
-      buf)))
-(def %vi-drained
-  (fn (_ again buf b)
-    (if (null? b) ()
-      (%vi-drained-report again (string-append buf (bytes->str (list b)))))))
-(def %vi-drained-report
-  (fn (_ again buf)
-    (def rc (%vi-cursor-report buf))
-    (if (null? rc) (again buf)
-      (do (set! %vi-cursor-reply rc) %vi-key-cursor-pos))))
-
-; busybox's test for a cursor report: [ ROW ; COL R, each number from 1
-; through 0x7FFF; (ROW . COL), or nil
-(def %vi-cursor-report
-  (fn (_ s)
-    (def n (byte-len s))
-    (match
-      ((vi< n 5) ())
-      ((not (= (byte-at s 0) #\[)) ())
-      ((not (= (byte-at s (vi- n 1)) #\R)) ())
-      ((not (%vi-digit? (byte-at s 1))) ())
-      (#t (%vi-cursor-report-col s (%vi-number-at s 1))))))
-(def %vi-cursor-report-col
-  (fn (_ s row)
-    (def at (rest row))
-    (def ok? (if (vi< (vi+ at 1) (byte-len s))
-               (if (= (byte-at s at) #\;) (%vi-digit? (byte-at s (vi+ at 1))) #f)
-               #f))
-    (if ok? (%vi-cursor-report-end s (first row) (%vi-number-at s (vi+ at 1))) ())))
-; the number in S's digits from I, and where they stop: (N . END)
-(def %vi-number-at
-  (fn (_ s i)
-    (def end (%vi-digits-end i s))
-    (pair (vi-num-from s i end 0) end)))
-(def %vi-cursor-report-end
-  (fn (_ s row col)
-    (match
-      ((not (= (rest col) (vi- (byte-len s) 1))) ())
-      ((vi< row 1) ())
-      ((vi< (first col) 1) ())
-      ((vi< 32767 (%vi| row (first col))) ())
-      (#t (pair row (first col))))))
-
-(def %vi-escape-rest
-  (fn (_ again buf)
-    (match
-      ((null? buf) ())
-      ((number? buf) buf)
-      ((vi< (byte-len buf) 2) (do (set! %vi-kbuf (%vi-str->list buf)) 27))
-      (#t (again)))))
+; whether no key waits to be read
+(def %vi-keys-idle?
+  (fn (_) (if %vi-esc-held (%vi-kb idle?) (if (%vi-src-ready? 0) #f #t))))
 
 (def %vi-list->str (fn (_ l) (if (null? l) "" (bytes->str l))))
-(def %vi-str->list
-  (fn (_ s) (if (= (byte-len s) 0) () (list (vi& (byte-at s 0) 255)))))
 
 ; busybox's readit: a key, or the editor ends when the input does.
 ; busybox's get_one_char: a key . replays first, as it was kept; else one
@@ -1698,7 +1570,7 @@
     (%vi-line-kept!)
     (%vi-dot-watch! c)
     (%vi-do-cmd c)
-    (if (if (null? %vi-kbuf) (if (%vi-src-ready? 0) #f #t) #f)
+    (if (%vi-keys-idle?)
       (do (%vi-refresh! #f) (%vi-show-status-line!) (%vi-sweep-if-due!))
       ())
     ()))
@@ -1744,7 +1616,7 @@
 (def vi-init-g!
   (fn (_)
     (set! %vi-optind 0)
-    (set! %vi-kbuf ())
+    (%vi-io-make!)
     (set! %vi-out ())
     (set! %vi-status "")
     (set! %vi-have-status 0)
@@ -1812,7 +1684,7 @@
     (set! %vi-files files)
     (set! %vi-initial-cmds cmds)
     (%vi-startup-cmds!)
-    (%vi-put %vi-alt-on)
+    (%vi-put (%vi-pane enter))
     (guard (e (do (%vi-cooked!) (error e)))
       (%vi-each-file))))
 
@@ -1823,7 +1695,7 @@
     (match
       ((not (null? ended)) (%vi-input-ended))
       ((vi< %vi-optind (length %vi-files)) (self))
-      (#t (do (%vi-put %vi-alt-off) (%vi-flush!) 0)))))
+      (#t (do (%vi-put (%vi-pane leave)) (%vi-flush!) 0)))))
 
 (def %vi-input-ended
   (fn (_)
